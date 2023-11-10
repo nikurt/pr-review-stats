@@ -2,6 +2,7 @@ import os
 import requests
 import json
 from dateutil.parser import isoparse
+from datetime import datetime, timedelta
 
 token = os.getenv('GITHUB_TOKEN')
 
@@ -253,12 +254,67 @@ def analyze_repo(owner, name):
         if result is None:
             continue
         author, number, published_at, latencies, unsolicited_reviews, unresponded_requests = result
-        yield (owner, name, author, number, published_at, latencies,
-               unsolicited_reviews, unresponded_requests)
+        tuple = (owner, name, author, number, published_at, latencies,
+                 unsolicited_reviews, unresponded_requests)
+        yield tuple
 
 
 def parse_datetime(s):
     return isoparse(s)
+
+
+def is_business_day(date, user):
+    if date.weekday() < 5:
+        return True
+    # TODO: Add some holidays
+
+
+def business_days_between(start_date, end_date, user):
+    if start_date.date() == end_date.date():
+        if is_business_day(start_date, user):
+            return 1
+        else:
+            return 0
+
+    full_days_delta = int(
+        (end_date - start_date).total_seconds()) // (24 * 60 * 60)
+    holidays = 0
+    day = timedelta(days=1)
+    d = start_date + day
+    while d.date() != end_date.date():
+        if is_business_day(d, user):
+            holidays += 1
+        d += day
+
+    business_days = full_days_delta - holidays
+    assert business_days >= 0
+    if is_business_day(start_date, user) and is_business_day(end_date, user):
+        return business_days + 1
+    else:
+        return business_days
+
+
+class Review(object):
+
+    def __init__(self, t1, t2, user):
+        assert t1 <= t2
+        self.t1 = t1
+        self.t2 = t2
+        self.user = user
+        self.business_days = business_days_between(t1, t2, user)
+        assert self.business_days >= 0
+        self.seconds = int((t2 - t1).total_seconds())
+        assert self.seconds >= 0
+
+    def __str__(self):
+        return str(
+            f"business_days={self.business_days}, seconds={self.seconds}, user={self.user}, t1={self.t1}, t2={self.t2}"
+        )
+
+    def __repr__(self):
+        return str(
+            f"business_days={self.business_days}, seconds={self.seconds}, user={self.user}, t1={self.t1}, t2={self.t2}"
+        )
 
 
 def analyze_pr_timeline(timeline):
@@ -303,21 +359,21 @@ def analyze_pr_timeline(timeline):
                 if reviewer in outstanding_review_request_per_reviewer:
                     started_at = outstanding_review_request_per_reviewer[
                         "reviewer"]
-                    delay = created_at - started_at
                     del outstanding_review_request_per_reviewer["reviewer"]
                     assert reviewer not in outstanding_review_request_per_reviewer
-                    latencies.append((reviewer, delay, state, num_comments))
+                    latencies.append((Review(started_at, created_at,
+                                             reviewer), state, num_comments))
                 else:
-                    delay = created_at - published_at
                     unsolicited_reviews.append(
-                        (reviewer, delay, state, num_comments))
+                        (Review(published_at, created_at,
+                                reviewer), state, num_comments))
             case "MergedEvent" | "ClosedEvent":
                 stop_at = created_at
             case "ReadyForReviewEvent":
                 pass
     for reviewer in outstanding_review_request_per_reviewer:
         created_at = outstanding_review_request_per_reviewer[reviewer]
-        unresponded_requests.append((reviewer, stop_at - created_at))
+        unresponded_requests.append(Review(created_at, stop_at, reviewer))
     return author, number, published_at, latencies, unsolicited_reviews, unresponded_requests
 
 
@@ -327,7 +383,8 @@ def main():
                           ('near', 'nearcore')]:
         for item in analyze_repo(owner, name):
             stats.append(item)
-    print(stats)
+            print(item)
+    # print(stats)
 
 
 if __name__ == '__main__':
