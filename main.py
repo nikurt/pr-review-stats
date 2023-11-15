@@ -343,6 +343,19 @@ class Review(object):
         else:
             assert False
 
+    def csv_header(self):
+        return "business_days,wall_time_seconds,reviewer,t1,t2,pr,review_type,author,repo"
+
+    def csv(self):
+        return ','.join([
+            str(v) for v in [
+                self.business_days, self.seconds, self.user, self.t1, self.t2,
+                self.number,
+                self.str_review_type(
+                    self.review_type), self.pr_author, self.repo
+            ]
+        ])
+
 
 def analyze_pr_timeline(timeline, repo):
     prev_event_created_at = None
@@ -415,6 +428,8 @@ def analyze_pr_timeline(timeline, repo):
                 if reviewer is None:
                     continue
                 reviewer = reviewer["login"]
+                if reviewer == pr_author:
+                    continue
                 if reviewer in outstanding_review_request_per_reviewer:
                     started_at = outstanding_review_request_per_reviewer[
                         reviewer]
@@ -470,37 +485,48 @@ class UserStats(object):
     def get_num_prs(self, business_days, types):
         return len(self.get_prs(business_days, types))
 
+    def get_all_prs(self):
+        for b in self.buckets:
+            for r in b:
+                yield r
+
 
 def summarize(reviews):
     user_stats = {}
     num_buckets = 10
-    user_stats[''] = UserStats('', num_buckets)
+    any_review = None
     for pr in reviews:
         for review in pr[5]:
             review = review[0]
+            if not any_review:
+                any_review = review
             user = review.user
             if user not in user_stats:
                 user_stats[user] = UserStats(user, num_buckets)
             user_stats[user].add(review)
-            user_stats[''].add(review)
 
-    for user in sorted(user_stats.keys()):
-        s = user_stats[user]
-        print(user, [
-            s.get_num_prs(d, RESPONDED | NO_RESPONSE)
-            for d in range(num_buckets)
-        ])
+    #for user in sorted(user_stats.keys()):
+    #    s = user_stats[user]
+    #    print(user, [
+    #        s.get_num_prs(d, RESPONDED | NO_RESPONSE)
+    #        for d in range(num_buckets)
+    #    ])
 
-    for user in sorted(user_stats.keys()):
-        s = user_stats[user]
-        print(user,
-              [s.get_num_prs(d, UNSOLICITED) for d in range(num_buckets)])
+    #for user in sorted(user_stats.keys()):
+    #    s = user_stats[user]
+    #    print(user,
+    #          [s.get_num_prs(d, UNSOLICITED) for d in range(num_buckets)])
 
-    for d in range(0, 10):
-        print(f"days: {d} RESPONDED")
-        for q in sorted(user_stats[''].get_prs(d, RESPONDED),
-                        key=lambda x: x.number):
-            print(f"{q}")
+    #for d in range(0, 10):
+    #    print(f"days: {d} UNSOLICITED")
+    #    for q in sorted(user_stats[''].get_prs(d, UNSOLICITED),
+    #                    key=lambda x: x.number):
+    #        print(f"{q}")
+    print(any_review.csv_header())
+    for user in user_stats:
+        for review in user_stats[user].get_all_prs():
+            if review.t1 > parse_datetime('2023-08-01T00:00:00Z'):
+                print(review.csv())
 
 
 def main():
