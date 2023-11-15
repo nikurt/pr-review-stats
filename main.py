@@ -14,6 +14,10 @@ headers = {
     'Content-Type': 'application/json'
 }
 
+NO_RESPONSE = 1
+UNSOLICITED = 2
+RESPONDED = 4
+
 all_prs_query = """
 query($owner:String!, $name:String!, $afterCursor:String) {
   repository(owner: $owner, name: $name) {
@@ -64,6 +68,7 @@ query($pr:Int!, $owner:String!, $name:String!) {
             ASSIGNED_EVENT,
             CLOSED_EVENT,
             CONVERT_TO_DRAFT_EVENT,
+            ISSUE_COMMENT,
             MERGED_EVENT,
             PULL_REQUEST_REVIEW,
             PULL_REQUEST_REVIEW_THREAD,
@@ -86,6 +91,12 @@ query($pr:Int!, $owner:String!, $name:String!) {
                     actor {
                        login
                     }
+                  }
+                  ... on IssueComment {
+                    author {
+                      login
+                    }
+                    createdAt
                   }
                   ... on MergedEvent {
                     createdAt
@@ -169,7 +180,7 @@ class DB(object):
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         if os.path.exists(file_path):
             with open(file_path, 'r') as f:
-                print(f"Found value {keys}")
+                # print(f"Found value {keys}")
                 return json.load(f)
         print(f"Value not found {keys}")
         return None
@@ -198,8 +209,7 @@ def execute_query(query, vars):
             print(f"Got response {vars}")
             return result
     else:
-        print("Query failed to run by returning code of {}. {}".format(
-            response.status_code, query))
+        print(response.json())
     raise 1
     return None
 
@@ -246,17 +256,16 @@ def get_pr_timeline(owner, name, pr):
 
 
 def analyze_repo(owner, name):
+    repo = f'{owner}/{name}'
     for pr in get_all_prs(owner, name):
         pr_id = pr["node"]["number"]
         pr_timeline = get_pr_timeline(owner, name, pr_id)
         result = analyze_pr_timeline(
-            pr_timeline["data"]["repository"]["pullRequest"])
+            pr_timeline["data"]["repository"]["pullRequest"], repo)
         if result is None:
             continue
-        author, number, published_at, latencies, unsolicited_reviews, unresponded_requests = result
-        tuple = (owner, name, author, number, published_at, latencies,
-                 unsolicited_reviews, unresponded_requests)
-        yield tuple
+        author, number, published_at, reviews = result
+        yield (owner, name, author, number, published_at, reviews)
 
 
 def parse_datetime(s):
@@ -264,9 +273,13 @@ def parse_datetime(s):
 
 
 def is_business_day(date, user):
-    if date.weekday() < 5:
-        return True
-    # TODO: Add some holidays
+    if date > parse_datetime('2022-12-26T00:00:00Z') and date < parse_datetime(
+            '2023-01-01T00:00:00Z'):
+        return False
+    if date > parse_datetime('2023-07-02T00:00:00Z') and date < parse_datetime(
+            '2023-07-09T00:00:00Z'):
+        return False
+    return date.weekday() < 5
 
 
 def business_days_between(start_date, end_date, user):
@@ -282,7 +295,7 @@ def business_days_between(start_date, end_date, user):
     day = timedelta(days=1)
     d = start_date + day
     while d.date() != end_date.date():
-        if is_business_day(d, user):
+        if not is_business_day(d, user):
             holidays += 1
         d += day
 
@@ -296,7 +309,7 @@ def business_days_between(start_date, end_date, user):
 
 class Review(object):
 
-    def __init__(self, t1, t2, user):
+    def __init__(self, t1, t2, user, number, review_type, pr_author, repo):
         assert t1 <= t2
         self.t1 = t1
         self.t2 = t2
@@ -305,50 +318,79 @@ class Review(object):
         assert self.business_days >= 0
         self.seconds = int((t2 - t1).total_seconds())
         assert self.seconds >= 0
+        self.number = number
+        self.review_type = review_type
+        self.pr_author = pr_author
+        self.repo = repo
 
     def __str__(self):
         return str(
-            f"business_days={self.business_days}, seconds={self.seconds}, user={self.user}, t1={self.t1}, t2={self.t2}"
+            f"business_days={self.business_days}, seconds={self.seconds}, user={self.user}, t1={self.t1}, t2={self.t2}, pr={self.number}, review_type={self.str_review_type(self.review_type)}, pr_author={self.pr_author}, repo={self.repo}"
         )
 
     def __repr__(self):
         return str(
-            f"business_days={self.business_days}, seconds={self.seconds}, user={self.user}, t1={self.t1}, t2={self.t2}"
+            f"business_days={self.business_days}, seconds={self.seconds}, user={self.user}, t1={self.t1}, t2={self.t2}, pr={self.number}, review_type={self.str_review_type(self.review_type)}, pr_author={self.pr_author}, repo={self.repo}"
         )
 
+    def str_review_type(self, review_type):
+        if review_type == NO_RESPONSE:
+            return "NO_RESPONSE"
+        elif review_type == UNSOLICITED:
+            return "UNSOLICITED"
+        elif review_type == RESPONDED:
+            return "RESPONDED"
+        else:
+            assert False
 
-def analyze_pr_timeline(timeline):
+
+def analyze_pr_timeline(timeline, repo):
     prev_event_created_at = None
-    author = timeline["author"]
-    if author is None:
-        return None
-    author = author["login"]
+    pr_author = timeline["author"]
+    if pr_author is not None:
+        pr_author = pr_author["login"]
     number = timeline["number"]
     published_at = parse_datetime(timeline["publishedAt"])
-    print(number, author, published_at)
+    # print(number, pr_author, published_at)
     outstanding_review_request_per_reviewer = {}
-    latencies = []
+    reviews = []
     stop_at = None
-    unsolicited_reviews = []
-    unresponded_requests = []
+    events = []
+
     for event in timeline["timelineItems"]["nodes"]:
         event_type = event["__typename"]
         if event_type == "AssignedEvent":
             continue
         created_at = parse_datetime(event["createdAt"])
-        print(event_type, created_at)
+        events.append((created_at, event))
+
+    for (created_at, event) in sorted(events, key=lambda x: x[0]):
+        event_type = event["__typename"]
+        # print(event_type, created_at)
         if prev_event_created_at is not None:
             assert created_at >= prev_event_created_at
             prev_event_created_at = created_at
         match event_type:
-            case "ReviewRequestEvent":
-                assert stop_at is None
+            case "ReviewRequestRemovedEvent":
                 reviewer = event["requestedReviewer"]
-                if "login" in reviewer:
+                if reviewer and "login" in reviewer:
                     reviewer = reviewer["login"]
-                    assert reviewer not in outstanding_review_request_per_reviewer
-                    outstanding_review_request_per_reviewer[
-                        reviewer] = created_at
+                    if reviewer in outstanding_review_request_per_reviewer:
+                        started_at = outstanding_review_request_per_reviewer[
+                            reviewer]
+                        reviews.append(
+                            (Review(started_at, created_at, reviewer, number,
+                                    RESPONDED, pr_author, repo), None, None))
+                        del outstanding_review_request_per_reviewer[reviewer]
+                        assert reviewer not in outstanding_review_request_per_reviewer
+            case "ReviewRequestedEvent":
+                # assert stop_at is None
+                reviewer = event["requestedReviewer"]
+                if reviewer and "login" in reviewer:
+                    reviewer = reviewer["login"]
+                    if reviewer not in outstanding_review_request_per_reviewer:
+                        outstanding_review_request_per_reviewer[
+                            reviewer] = created_at
             case "PullRequestReview":
                 state = event["state"]
                 reviewer = event["author"]
@@ -358,33 +400,116 @@ def analyze_pr_timeline(timeline):
                 num_comments = event["comments"]["totalCount"]
                 if reviewer in outstanding_review_request_per_reviewer:
                     started_at = outstanding_review_request_per_reviewer[
-                        "reviewer"]
-                    del outstanding_review_request_per_reviewer["reviewer"]
+                        reviewer]
+                    del outstanding_review_request_per_reviewer[reviewer]
                     assert reviewer not in outstanding_review_request_per_reviewer
-                    latencies.append((Review(started_at, created_at,
-                                             reviewer), state, num_comments))
+                    reviews.append((Review(started_at, created_at, reviewer,
+                                           number, RESPONDED, pr_author,
+                                           repo), state, num_comments))
                 else:
-                    unsolicited_reviews.append(
-                        (Review(published_at, created_at,
-                                reviewer), state, num_comments))
+                    reviews.append((Review(published_at, created_at, reviewer,
+                                           number, UNSOLICITED, pr_author,
+                                           repo), state, num_comments))
+            case "IssueComment":
+                reviewer = event["author"]
+                if reviewer is None:
+                    continue
+                reviewer = reviewer["login"]
+                if reviewer in outstanding_review_request_per_reviewer:
+                    started_at = outstanding_review_request_per_reviewer[
+                        reviewer]
+                    del outstanding_review_request_per_reviewer[reviewer]
+                    assert reviewer not in outstanding_review_request_per_reviewer
+                    reviews.append(
+                        (Review(started_at, created_at, reviewer, number,
+                                RESPONDED, pr_author, repo), None, None))
+                else:
+                    reviews.append(
+                        (Review(published_at, created_at, reviewer, number,
+                                UNSOLICITED, pr_author, repo), None, None))
             case "MergedEvent" | "ClosedEvent":
                 stop_at = created_at
             case "ReadyForReviewEvent":
                 pass
     for reviewer in outstanding_review_request_per_reviewer:
         created_at = outstanding_review_request_per_reviewer[reviewer]
-        unresponded_requests.append(Review(created_at, stop_at, reviewer))
-    return author, number, published_at, latencies, unsolicited_reviews, unresponded_requests
+        reviews.append((Review(created_at, stop_at, reviewer, number,
+                               NO_RESPONSE, pr_author, repo), None, None))
+    return pr_author, number, published_at, reviews
+
+
+class UserStats(object):
+
+    def __init__(self, user, n):
+        self.user = user
+        self.buckets = []
+        for i in range(n):
+            self.buckets.append([])
+
+    def add(self, review):
+        # assert review.user == self.user
+        if review.business_days >= len(self.buckets):
+            self.buckets[-1].append(review)
+        else:
+            self.buckets[review.business_days].append(review)
+
+    def __str__(self):
+        return str(
+            f"User={self.user}, Buckets={' '.join([str((i,len(bucket))) for (i,bucket) in enumerate(self.buckets)])}"
+        )
+
+    def get_prs(self, business_days, types):
+        assert business_days >= 0 and business_days < len(self.buckets)
+        reviews = []
+        for review in self.buckets[business_days]:
+            if (review.review_type & types
+                ) != 0 and review.t1 > parse_datetime('2022-11-01T00:00:00Z'):
+                reviews.append(review)
+        return reviews
+
+    def get_num_prs(self, business_days, types):
+        return len(self.get_prs(business_days, types))
+
+
+def summarize(reviews):
+    user_stats = {}
+    num_buckets = 10
+    user_stats[''] = UserStats('', num_buckets)
+    for pr in reviews:
+        for review in pr[5]:
+            review = review[0]
+            user = review.user
+            if user not in user_stats:
+                user_stats[user] = UserStats(user, num_buckets)
+            user_stats[user].add(review)
+            user_stats[''].add(review)
+
+    for user in sorted(user_stats.keys()):
+        s = user_stats[user]
+        print(user, [
+            s.get_num_prs(d, RESPONDED | NO_RESPONSE)
+            for d in range(num_buckets)
+        ])
+
+    for user in sorted(user_stats.keys()):
+        s = user_stats[user]
+        print(user,
+              [s.get_num_prs(d, UNSOLICITED) for d in range(num_buckets)])
+
+    for d in range(0, 10):
+        print(f"days: {d} RESPONDED")
+        for q in sorted(user_stats[''].get_prs(d, RESPONDED),
+                        key=lambda x: x.number):
+            print(f"{q}")
 
 
 def main():
-    stats = []
+    reviews = []
     for (owner, name) in [('near', 'NEPs'), ('near', 'near-ops'),
                           ('near', 'nearcore')]:
-        for item in analyze_repo(owner, name):
-            stats.append(item)
-            print(item)
-    # print(stats)
+        for r in analyze_repo(owner, name):
+            reviews.append(r)
+    summarize(reviews)
 
 
 if __name__ == '__main__':
